@@ -129,7 +129,7 @@ class NNLM_Weight(object):
             gnp.clip(self.weights[key], clip_min, clip_max, out=nn_output.weights[key])
         return nn_output
     def get_architecture(self):
-        return [self.weights['projection'].shape[1], self.bias[1].size, self.bias['output'].size]
+        return [self.weights['projection'].shape[1], self.bias['prehidden'].size, self.bias['output'].size]
     @property
     def size(self, excluded_keys = {'bias': [], 'weights': []}):
         numel = 0
@@ -155,6 +155,12 @@ class NNLM_Weight(object):
         except IOError:
             print "Unable to open", weight_matrix_name, "exiting now"
             sys.exit()
+        weight_dict['num_previous_tokens'] = self.num_previous_tokens
+	weight_dict['bias_prehidden'] = self.bias['prehidden'].as_numpy_array()
+	weight_dict['weights_prehidden'] = self.weights['prehidden'].as_numpy_array()
+        weight_dict['weights_output'] = self.weights['output'].as_numpy_array()
+        weight_dict['bias_output'] = self.bias['output'].as_numpy_array()
+        weight_dict['projection_layer'] = self.weights['projection'].as_numpy_array()
         if 'num_previous_tokens' in weight_dict:
             self.num_previous_tokens = weight_dict['num_previous_tokens'][0]
             if type(self.num_previous_tokens) is not int: #hack because write_weights() stores num_layers as [[num_layers]] 
@@ -181,36 +187,38 @@ class NNLM_Weight(object):
     def init_random_weights(self, architecture, initial_bias_max, initial_bias_min, initial_weight_min, 
                            initial_weight_max, seed = 0, verbose = False): #completed, expensive, should be compiled
         np.random.seed(seed)
-        
-        self.weights['projection'] = np.random.randn(architecture[0], architecture[1])
+        print architecture
+        self.weights['projection'] = gnp.randn(architecture[-1], architecture[1])
+	print self.weights['projection'].shape
         initial_bias_range = initial_bias_max - initial_bias_min
         initial_weight_range = initial_weight_max - initial_weight_min
+	num_prehiddens = architecture[1] * self.num_previous_tokens
+        self.bias['prehidden'] = gnp.garray(initial_bias_min + initial_bias_range * np.random.random_sample((1,architecture[2])))
+        self.weights['prehidden'] = gnp.garray(initial_weight_min + initial_weight_range * 
+                                      	     np.random.random_sample( (num_prehiddens, architecture[2]) ))
         
-        for layer_num in range(1,self.num_previous_tokens):
-            self.bias[layer_num] = initial_bias_min + initial_bias_range * np.random.random_sample((1,architecture[2]))
-            self.weights[layer_num] = (initial_weight_min + initial_weight_range * 
-                                       np.random.random_sample( (architecture[1],architecture[2]) ))
-        
-        self.bias['output'] = initial_bias_min + initial_bias_range * np.random.random_sample((1,architecture[-1]))
-        self.weights['output'] = (initial_weight_min + initial_weight_range * 
-                                  np.random.random_sample( (architecture[-2],architecture[-1]) ))
-        
-        if verbose:
-            print "Finished Initializing Weights"
-        self.check_weights()
-    def init_zero_weights(self, architecture, last_layer_logistic=True, verbose=False):
-        self.weights['projection'] = np.zeros((architecture[0], architecture[1]))
-        
-        for layer_num in range(1,self.num_previous_tokens):
-            self.bias[layer_num] = np.zeros((1,architecture[2]))
-            self.weights[layer_num] = np.zeros( (architecture[1],architecture[2]) )
-        
-        self.bias['output'] = np.zeros((1,architecture[-1]))
-        self.weights['output'] = np.zeros( (architecture[-2],architecture[-1]) )
+        self.bias['output'] = gnp.garray(initial_bias_min + initial_bias_range * np.random.random_sample((1,architecture[-1])))
+        self.weights['output'] = gnp.garray(initial_weight_min + initial_weight_range * 
+                                  	    np.random.random_sample( (architecture[-2],architecture[-1]) ))
         
         if verbose:
             print "Finished Initializing Weights"
-        self.check_weights(False)
+	self.write_weights('init_random_weights.mat')
+#        self.check_weights()
+    def init_zero_weights(self, architecture, verbose=False):
+        self.weights['projection'] = gnp.zeros((architecture[0], architecture[1]))
+
+	num_prehiddens = architecture[1] * self.num_previous_tokens        
+
+        self.bias['prehidden'] = gnp.zeros((1,hiddens_per_token))
+        self.weights['prehidden'] = gnp.zeros( (num_prehiddens, architecture[2]) )
+        
+        self.bias['output'] = gnp.zeros((1,architecture[-1]))
+        self.weights['output'] = gnp.zeros( (architecture[-2],architecture[-1]) )
+        
+        if verbose:
+            print "Finished Initializing Weights"
+#        self.check_weights(False)
     def check_weights(self, verbose=True): #need to check consistency of features with weights
         #checks weights to see if following conditions are true
         # *feature dimension equal to number of rows of first layer (if weights are stored in n_rows x n_cols)
@@ -267,13 +275,11 @@ class NNLM_Weight(object):
     def write_weights(self, output_name): #completed
         weight_dict = dict()
         weight_dict['num_previous_tokens'] = self.num_previous_tokens
-        for layer_num in range(1, self.num_previous_tokens+1):
-            cur_layer = str(layer_num)
-            weight_dict[''.join(['bias', cur_layer])] = self.bias[layer_num]
-            weight_dict[''.join(['weights', cur_layer])] = self.weights[layer_num]
-        weight_dict['weights_output'] = self.weights['output']
-        weight_dict['bias_output'] = self.bias['output']
-        weight_dict['projection_layer'] = self.projection_layer
+	weight_dict['bias_prehidden'] = self.bias['prehidden'].as_numpy_array()
+	weight_dict['weights_prehidden'] = self.weights['prehidden'].as_numpy_array()
+        weight_dict['weights_output'] = self.weights['output'].as_numpy_array()
+        weight_dict['bias_output'] = self.bias['output'].as_numpy_array()
+        weight_dict['projection_layer'] = self.weights['projection'].as_numpy_array()
         try:
             sp.savemat(output_name, weight_dict, oned_as='column')
         except IOError:
@@ -439,8 +445,9 @@ class NNLM(object, Vector_Math):
         self.feature_file_name = self.default_variable_define(config_dictionary, 'feature_file_name', arg_type='string')
 #        print "Amount of memory in use before reading feature file is", gnp.memory_in_use(True), "MB"
         self.features = self.read_feature_file()
+	self.num_previous_tokens = self.features.shape[1]
 #        print "Amount of memory in use after reading feature file is", gnp.memory_in_use(True), "MB"
-        self.model = NNLM_Weight()
+        self.model = NNLM_Weight(self.num_previous_tokens)
         self.output_name = self.default_variable_define(config_dictionary, 'output_name', arg_type='string')
         
         self.required_variables = dict()
@@ -519,7 +526,7 @@ class NNLM(object, Vector_Math):
                 return default_value
     def read_feature_file(self): #completed
         try:
-            return gnp.garray(sp.loadmat(self.feature_file_name)['features']) #in MATLAB format
+            return sp.loadmat(self.feature_file_name)['features'] #in MATLAB format
         except IOError:
             print "Unable to open ", self.feature_file_name, "... Exiting now"
             sys.exit()
@@ -616,30 +623,32 @@ class NNLM(object, Vector_Math):
         if self.labels.size != self.features.shape[0]:
             print "Number of examples in feature file: ", self.features.shape[0], " does not equal size of label file, ", self.labels.size, "... Exiting now"
             sys.exit()
-        if  [i for i in np.unique(self.labels)] != range(np.max(self.labels)+1):
-            print "Labels need to be in the form 0,1,2,....,n,... Exiting now"
+#        if  [i for i in np.unique(self.labels)] != range(np.max(self.labels)+1):
+#            print "Labels need to be in the form 0,1,2,....,n,... Exiting now"
             sys.exit()      
         print "labels seem copacetic"
     def forward_layer(self, inputs, model = None, layer_type = None): #completed
         if model == None:
             model = self.model
         if layer_type == 'projection':
-#            projection_layer_size = model.get_architecture()[0]
-            outputs = dict()
+            projection_layer_size = model.weights['projection'].shape[1]
+	    num_examples = inputs.shape[0]
+	    num_outs = self.model.num_previous_tokens * projection_layer_size
+            outputs = gnp.zeros((num_examples, num_outs))
             for weight_index in range(self.model.num_previous_tokens):
-                output_weight_index = weight_index + 1
-                outputs[output_weight_index] = model.weights['projection'][[inputs[:,weight_index]]]
+                start_index = projection_layer_size * weight_index
+		end_index = projection_layer_size * (1 + weight_index)
+#		print inputs[:,weight_index].astype(int)
+#		print model.weights['projection'][inputs[:,weight_index].astype(int),:]
+#		print outputs[:,start_index:end_index].shape
+                outputs[:,start_index:end_index] = model.weights['projection'][(inputs[:,weight_index]),:]
                 gnp.free_reuse_cache(False)
             return outputs
         elif layer_type == 'prehidden':
             #in this case, inputs, weights, and biases are stored in a dictionary
             hiddens_per_token = self.model.get_architecture()[1]
-            outputs = gnp.zeros((hiddens_per_token * self.model.num_previous_tokens,))
-            for weight_index in range(1, self.model.num_previous_tokens + 1):
-                start_index = (weight_index - 1) * hiddens_per_token
-                end_index = start_index + hiddens_per_token
-                outputs[start_index:end_index] = self.sigmoid(self.weight_matrix_multiply(inputs[weight_index], self.model.weights[weight_index], self.model.bias[weight_index]))
-                gnp.free_reuse_cache(False)
+            outputs = self.sigmoid(self.weight_matrix_multiply(inputs, self.model.weights['prehidden'], self.model.bias['prehidden']))
+            gnp.free_reuse_cache(False)
             return outputs
         elif layer_type == 'output':
             outputs =  self.softmax(self.weight_matrix_multiply(inputs, model.weights['output'], model.bias['output']))
@@ -791,10 +800,10 @@ class NNLM_Trainer(NNLM):
                 
             self.initial_weight_max = self.default_variable_define(config_dictionary, 'initial_weight_max', arg_type='float', default_value=0.1)
             self.initial_weight_min = self.default_variable_define(config_dictionary, 'initial_weight_min', arg_type='float', default_value=-0.1)
-            self.initial_bias_max = self.default_variable_define(config_dictionary, 'initial_bias_max', arg_type='float', default_value=-2.2)
-            self.initial_bias_min = self.default_variable_define(config_dictionary, 'initial_bias_max', arg_type='float', default_value=-2.4)
+            self.initial_bias_max = self.default_variable_define(config_dictionary, 'initial_bias_max', arg_type='float', default_value=0.1)
+            self.initial_bias_min = self.default_variable_define(config_dictionary, 'initial_bias_max', arg_type='float', default_value=-0.1)
             self.model.init_random_weights(architecture, self.initial_bias_max, self.initial_bias_min, 
-                                           self.initial_weight_min, self.initial_weight_max, last_layer_logistic=hasattr(self,'labels'))
+                                           self.initial_weight_min, self.initial_weight_max)
             del architecture #we have it in the model
         #
 #        print "Amount of memory in use before reading weights file is", gnp.memory_in_use(True), "MB"
@@ -875,7 +884,7 @@ class NNLM_Trainer(NNLM):
     def backprop_steepest_descent(self): #need to test regularization
         self.memory_management()
         print "starting backprop using steepest descent"
-        print "Number of layers is", self.model.num_layers
+        print "Number of previous tokens are", self.model.num_previous_tokens
         
         cross_entropy, num_correct, num_examples, loss = self.calculate_classification_statistics(self.features, self.labels, self.model)
         print "cross-entropy before steepest descent is", cross_entropy
@@ -887,9 +896,10 @@ class NNLM_Trainer(NNLM):
             print "At epoch", epoch_num+1, "of", len(self.steepest_learning_rate), "with learning rate", self.steepest_learning_rate[epoch_num]
             batch_index = 0
             end_index = 0
+
             while end_index < self.num_training_examples: #run through the batches
-                per_done = float(batch_index)/self.num_training_examples*100
-                sys.stdout.write("\r%.1f%% done" % per_done), sys.stdout.flush()
+                per_done = min(float(batch_index)/self.num_training_examples*100, 100.0)
+                sys.stdout.write("%.1f%% done\n" % per_done), sys.stdout.flush()
                 end_index = min(batch_index+self.backprop_batch_size,self.num_training_examples)
                 batch_size = end_index - batch_index
                 batch_inputs = self.features[batch_index:end_index]
@@ -897,10 +907,10 @@ class NNLM_Trainer(NNLM):
                 #calculating negative gradient of log softmax
                 
                 hidden_output_weight_vec = -outputs #batchsize x n_outputs
-                hidden_output_weight_vec[np.arange(batch_size), self.labels[batch_index:end_index].astype(int)] += 1
-#                for label_index in range(batch_index,end_index):
-#                    data_index = label_index - batch_index
-#                    weight_vec[data_index, int(self.labels[label_index])] += 1 #the int is to enforce proper indexing
+#                hidden_output_weight_vec[np.arange(batch_size), self.labels[batch_index:end_index].astype(int)] += 1
+                for label_index in range(batch_index,end_index):
+                    data_index = label_index - batch_index
+                    hidden_output_weight_vec[data_index, int(self.labels[label_index])] += 1 #the int is to enforce proper indexing
                 #averaging batches 
                 self.model.weights['output'] += (self.steepest_learning_rate[epoch_num] / batch_size) * (gnp.dot(hiddens.T, hidden_output_weight_vec) - self.l2_regularization_const * self.model.weights['output'])
                 self.model.bias['output'][0] += (self.steepest_learning_rate[epoch_num] / batch_size) * (gnp.sum(hidden_output_weight_vec, axis=0) - self.l2_regularization_const * self.model.bias['output'][0])
@@ -908,30 +918,33 @@ class NNLM_Trainer(NNLM):
                 #I don't use calculate_gradient because structure allows me to store only one layer of weights
                 
                 projection_hidden_weight_vec = gnp.dot(hidden_output_weight_vec, self.model.weights['output'].T) * hiddens * (1-hiddens) #n_hid x n_out * (batchsize x n_out), do the biases get involved in this calculation???
-                num_hiddens_per_token = self.model.get_architecture()[1]
+                num_hiddens_per_token = self.model.get_architecture()[0]
                 del hidden_output_weight_vec
                 gnp.free_reuse_cache(True)
-                projection_layer_weight_vec = dict()
+		self.model.weights['prehidden'] += self.steepest_learning_rate[epoch_num] / batch_size * (gnp.dot(word_vectors.T,projection_hidden_weight_vec) - self.l2_regularization_const * self.model.weights['prehidden'])
+                self.model.bias['prehidden'][0] += self.steepest_learning_rate[epoch_num] / batch_size * (gnp.sum(projection_hidden_weight_vec,axis=0) - self.l2_regularization_const * self.model.bias['prehidden'][0])
+
+		projection_layer_weight_vec = gnp.dot(projection_hidden_weight_vec, self.model.weights['prehidden'].T)
+
+		del projection_hidden_weight_vec
+		gnp.free_reuse_cache(True)
+
                 for token_num in range(1, self.model.num_previous_tokens+1):
-                    start_index = (token_num - 1) * num_hiddens_per_token
-                    end_index = token_num * num_hiddens_per_token
-                    weight_vec_per_token = projection_hidden_weight_vec[:,start_index:end_index] 
-                    gnp.free_reuse_cache(False)
-                    self.model.weights[token_num] += self.steepest_learning_rate[epoch_num] / batch_size * (gnp.dot(word_vectors[token_num].T,weight_vec_per_token) - self.l2_regularization_const * self.model.weights[token_num])
-                    self.model.bias[token_num][0] += self.steepest_learning_rate[epoch_num] / batch_size * (gnp.sum(hidden_output_weight_vec,axis=0) - self.l2_regularization_const * self.model.bias[token_num][0])
-                    projection_layer_weight_vec = gnp.dot(weight_vec_per_token, self.model.weights[token_num].T)
-                    projection_layer_update = np.zeros(self.model.weights['projection'].shape)
-                    projection_layer_update[batch_inputs] += projection_layer_weight_vec
+                    start_dim = (token_num - 1) * num_hiddens_per_token
+                    end_dim = token_num * num_hiddens_per_token
+		    token_inputs = batch_inputs[:,token_num-1]
+#                   weight_vec_per_token = projection_hidden_weight_vec[:,start_dim:end_dim] 
+#                   gnp.free_reuse_cache(False)
+#                   self.model.weights[token_num] += self.steepest_learning_rate[epoch_num] / batch_size * (gnp.dot(word_vectors[token_num].T,weight_vec_per_token) - self.l2_regularization_const * self.model.weights[token_num])
+#                    self.model.bias[token_num][0] += self.steepest_learning_rate[epoch_num] / batch_size * (gnp.sum(hidden_output_weight_vec,axis=0) - self.l2_regularization_const * self.model.bias[token_num][0])
+                    projection_layer_weight_vec_per_token = projection_layer_weight_vec[:, start_dim:end_dim]
+                    projection_layer_update = gnp.zeros(self.model.weights['projection'].shape)
+#		    projection_layer_update[token_inputs,:] += projection_layer_weight_vec_per_token
+		    for sent_index, token_input in enumerate(token_inputs):
+		        projection_layer_update[token_input] += projection_layer_weight_vec_per_token[sent_index]
                     self.model.weights['projection'] += self.steepest_learning_rate[epoch_num] / batch_size * (projection_layer_update - self.l2_regularization_const * self.model.weights['projection'])
                     gnp.free_reuse_cache(False)
                     
-                #do final weight_update
-#                self.model.weights[weight_cur_layer] += self.steepest_learning_rate[epoch_num] / batch_size * (weight_update - self.l2_regularization_const * self.model.weights[weight_cur_layer])
-#                self.model.bias[bias_cur_layer][0] += self.steepest_learning_rate[epoch_num] / batch_size * (bias_update - self.l2_regularization_const * self.model.bias[bias_cur_layer][0])
-#                del bias_update
-#                del weight_update
-#                del weight_vec
-#                gnp.free_reuse_cache(False)
                 batch_index += self.backprop_batch_size
             sys.stdout.write("\r100.0% done \r"), sys.stdout.flush()
             
@@ -950,7 +963,7 @@ class NNLM_Trainer(NNLM):
         excluded_keys = {'bias': ['0'], 'weights': []}
         
         if self.do_backprop == False:
-            classification_batch_size = 4096
+            classification_batch_size = 4096 
         else:
             classification_batch_size = max(self.backprop_batch_size, 4096)
         
@@ -984,3 +997,49 @@ class NNLM_Trainer(NNLM):
         outputs = self.forward_layer(hiddens, model, layer_type='output')
         gnp.free_reuse_cache(False)
         return word_vectors, hiddens, outputs
+    def memory_management(self):
+    	print "WARNING: Memory Management Not Implemented yet"
+
+if __name__ == '__main__':
+    script_name, config_filename = sys.argv
+    print "Opening config file: %s" % config_filename
+#    script_name = sys.argv[0]
+#    parser = init_arg_parser()
+#    config_dictionary = vars(parser.parse_args())
+    
+#    if config_dictionary['config_file'] != None :
+#        config_filename = config_dictionary['config_file']
+#        print "Since", config_filename, "is specified, ignoring other arguments"
+    try:
+        config_file=open(config_filename)
+    except IOError:
+        print "Could open file", config_filename, ". Usage is ", script_name, "<config file>... Exiting Now"
+        sys.exit()
+        
+#    del config_dictionary
+        
+        #read lines into a configuration dictionary, skipping lines that begin with #
+    config_dictionary = dict([line.replace(" ", "").strip(' \n\t').split('=') for line in config_file 
+                              if not line.replace(" ", "").strip(' \n\t').startswith('#') and '=' in line])
+    config_file.close()
+#    else:
+        #remove empty keys
+#        config_dictionary = dict([(arg,value) for arg,value in config_dictionary.items() if value != None])
+
+    try:
+        mode=config_dictionary['mode']
+    except KeyError:
+        print 'No mode found, must be train or test... Exiting now'
+        sys.exit()
+    else:
+        if (mode != 'train') and (mode != 'test'):
+            print "Mode", mode, "not understood. Should be either train or test... Exiting now"
+            sys.exit()
+    
+    if mode == 'test':
+        test_object = NNLM_Tester(config_dictionary)
+    else: #mode ='train'
+        train_object = NNLM_Trainer(config_dictionary)
+        train_object.backprop_steepest_descent()
+        
+    print "Finished without Runtime Error!" 
